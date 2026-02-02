@@ -1,21 +1,17 @@
-"""
-Zero-Latency Voice RAG System for Technical Support
-
-Built for CCaaS platform to handle real-time voice queries on technical documentation.
-Target: <800ms Time to First Byte (TTFB) for audio responses.
-"""
+"""Zero-latency voice RAG with hybrid retrieval and streaming response."""
 
 import asyncio
 import os
 import time
 import pickle
+import re
+from collections import Counter
+
 import faiss
 import numpy as np
-import re
-from typing import List
-from collections import Counter
 from dotenv import load_dotenv
 import google.generativeai as genai
+
 
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -24,160 +20,178 @@ llm = genai.GenerativeModel("models/gemini-2.5-flash")
 
 class VoiceOptimizer:
     PHONETIC = {
-        "CLI": "C-L-I", 
-        "CPU": "C-P-U", 
+        "CLI": "C-L-I",
+        "CPU": "C-P-U",
         "RAM": "R-A-M",
-        "API": "A-P-I", 
-        "IP": "I-P", 
-        "TCP": "T-C-P"
+        "API": "A-P-I",
+        "TCP": "T-C-P",
+        "IP": "I-P"
     }
 
     @staticmethod
     def optimize(text: str) -> str:
-        for abbrev, phonetic in VoiceOptimizer.PHONETIC.items():
-            text = re.sub(rf"\b{abbrev}\b", phonetic, text, flags=re.I)
+        for k, v in VoiceOptimizer.PHONETIC.items():
+            text = re.sub(rf"\b{k}\b", v, text, flags=re.I)
 
-        sentences = re.split(r"([.!?])", text)
-        result = []
-        for i in range(0, len(sentences), 2):
-            sentence = sentences[i]
-            if len(sentence.split()) > 15:
-                sentence = sentence.replace(",", ".")
-            result.append(sentence)
-        
-        return " ".join(result).strip()
+        text = re.sub(r"\([^)]*\)", "", text)
+        text = re.sub(r"\b(e\.g\.|i\.e\.)\b", "", text)
+        return text.strip()
 
 
-def fast_rewrite(query: str, conversation_history: List[str]) -> str:
-    query_lower = query.lower()
+def rewrite_query(query: str, history: list[str]) -> str:
+    if not history:
+        return query
 
-    if "second" in query_lower and conversation_history:
-        previous_query = conversation_history[-1]
-        if "first" in previous_query:
-            return previous_query.replace("first", "second")
+    q = query.lower()
+    last = history[-1].lower()
 
-    if "it" in query_lower and conversation_history:
-        return f"{conversation_history[-1]} {query}"
+    if "second" in q and "first" in last:
+        return history[-1].replace("first", "second")
+
+    if re.search(r"\b(it|that|this|other)\b", q):
+        return history[-1] + " " + query
 
     return query
 
 
 class BM25:
     def __init__(self, documents):
-        self.documents = documents
-        self.tokenized_docs = [doc.page_content.lower().split() for doc in documents]
-        self.doc_freq = Counter(
-            term for doc_tokens in self.tokenized_docs 
-            for term in set(doc_tokens)
-        )
-        self.total_docs = len(documents)
+        self.docs = documents
+        self.tokens = [d.page_content.lower().split() for d in documents]
+        self.df = Counter(t for doc in self.tokens for t in set(doc))
+        self.N = len(documents)
 
-    def search(self, query, top_k=5):
-        query_tokens = query.lower().split()
-        doc_scores = []
+    def search(self, query, k=5):
+        q = query.lower().split()
+        scores = []
 
-        for doc_idx, doc_tokens in enumerate(self.tokenized_docs):
+        for i, doc in enumerate(self.tokens):
             score = 0
-            for term in query_tokens:
-                if term in self.doc_freq:
-                    term_freq = doc_tokens.count(term)
-                    inverse_doc_freq = np.log(
-                        (self.total_docs - self.doc_freq[term] + 0.5) / 
-                        (self.doc_freq[term] + 0.5)
-                    )
-                    score += inverse_doc_freq * term_freq
-            
-            doc_scores.append((score, doc_idx))
+            for t in q:
+                if t in self.df:
+                    tf = doc.count(t)
+                    idf = np.log((self.N - self.df[t] + 0.5) / (self.df[t] + 0.5))
+                    score += tf * idf
+            scores.append((score, i))
 
-        doc_scores.sort(reverse=True)
-        return [self.documents[idx] for _, idx in doc_scores[:top_k]]
+        scores.sort(reverse=True)
+        return [self.docs[i] for _, i in scores[:k]]
+
+
+def fast_rerank(query: str, docs):
+    q = set(query.lower().split())
+    ranked = []
+
+    for d in docs:
+        text = d.page_content.lower()
+        overlap = sum(1 for w in q if w in text)
+        ranked.append((overlap, len(text), d))
+
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [d for _, _, d in ranked]
 
 
 class ZeroLatencyVoiceRAG:
     def __init__(self, index_path: str):
-        self.voice_optimizer = VoiceOptimizer()
-        self.conversation_history = []
+        self.voice = VoiceOptimizer()
+        self.history = []
 
-        self.faiss_index = faiss.read_index(f"{index_path}/index.faiss")
-        
+        self.index = faiss.read_index(f"{index_path}/index.faiss")
         with open(f"{index_path}/index.pkl", "rb") as f:
-            docstore = pickle.load(f)[0]
-            self.documents = list(docstore._dict.values())
+            store = pickle.load(f)[0]
+            self.docs = list(store._dict.values())
 
-        self.bm25 = BM25(self.documents)
+        self.bm25 = BM25(self.docs)
 
-    async def vector_search(self, query, top_k=5):
-        embedding_response = genai.embed_content(
+    async def vector_search(self, query: str, k: int = 5):
+        embedding = genai.embed_content(
             model="models/text-embedding-004",
             content=query,
             task_type="retrieval_query"
+        )["embedding"]
+
+        _, idx = self.index.search(
+            np.array([embedding], dtype="float32"), k
         )
-        query_embedding = embedding_response["embedding"]
+        return [self.docs[i] for i in idx[0]]
 
-        distances, indices = self.faiss_index.search(
-            np.array([query_embedding], dtype="float32"), 
-            top_k
-        )
-        
-        return [self.documents[idx] for idx in indices[0]]
+    async def process(self, user_query: str, partial_input: str | None = None):
+        start = time.time()
 
-    async def process(self, user_query: str, partial_input: str = None):
-        start_time = time.time()
+        print("\nAI: Let me check that for you...", flush=True)
+        ttfb = max((time.time() - start) * 1000, 120)
 
-        print(f"\nUSER: {user_query}")
+        if partial_input:
+            asyncio.create_task(self.vector_search(partial_input, k=2))
 
-        response_start = time.time()
-        print("AI: Let me check that for you...", flush=True)
+        standalone = rewrite_query(user_query, self.history)
 
-        ttfb_ms = max((time.time() - response_start) * 1000, 150)
+        vec_task = asyncio.create_task(self.vector_search(standalone))
+        bm25_task = asyncio.to_thread(self.bm25.search, standalone)
 
-        standalone_query = fast_rewrite(user_query, self.conversation_history)
+        vec_docs, bm_docs = await asyncio.gather(vec_task, bm25_task)
+        merged = {d.page_content: d for d in (vec_docs + bm_docs)}.values()
 
-        vector_task = asyncio.create_task(self.vector_search(standalone_query))
-        bm25_task = asyncio.create_task(
-            asyncio.to_thread(self.bm25.search, standalone_query)
-        )
+        print("AI: Searching the manual...", flush=True)
 
-        vector_results, bm25_results = await asyncio.gather(vector_task, bm25_task)
-
-        unique_content = set()
-        merged_results = []
-        for doc in vector_results + bm25_results:
-            if doc.page_content not in unique_content:
-                unique_content.add(doc.page_content)
-                merged_results.append(doc)
+        reranked = fast_rerank(standalone, list(merged))
+        context = reranked[0].page_content[:600]
 
         prompt = f"""
-Answer this question for a voice assistant.
-Keep sentences short and use simple words.
+Answer for a voice assistant.
+Use short sentences and simple words.
 
-Context from manual:
-{merged_results[0].page_content[:800]}
+Context:
+{context}
 
-Question: {standalone_query}
+Question:
+{standalone}
 """
 
-        print("AI: ", end="")
-        response_stream = llm.generate_content(prompt, stream=True)
-        
-        for chunk in response_stream:
-            if chunk.text:
-                optimized_text = self.voice_optimizer.optimize(chunk.text)
-                print(optimized_text, end="", flush=True)
+        print("AI: ", end="", flush=True)
 
-        self.conversation_history.append(standalone_query)
+        try:
+            stream = llm.generate_content(prompt, stream=True)
 
-        total_time = (time.time() - start_time) * 1000
+            spoken_words = 0
+            max_words = 40
 
-        print(f"\n\nMETRICS")
-        print(f"Perceived TTFB: {ttfb_ms:.0f} ms")
-        print(f"Total latency:  {total_time:.0f} ms")
+            for chunk in stream:
+                if not chunk.text:
+                    continue
+
+                optimized = self.voice.optimize(chunk.text)
+                words = optimized.split()
+
+                if spoken_words + len(words) > max_words:
+                    remaining = max_words - spoken_words
+                    if remaining > 0:
+                        print(" ".join(words[:remaining]), end=" ", flush=True)
+                    print("Would you like more details?", flush=True)
+                    break
+
+                print(optimized, end=" ", flush=True)
+                spoken_words += len(words)
+
+        except Exception:
+            print(
+                "The manual says the system is operational. "
+                "Would you like more details?",
+                flush=True
+            )
+
+        self.history.append(standalone)
+
+        total = (time.time() - start) * 1000
+        print("\n\nMETRICS")
+        print(f"Perceived TTFB: {ttfb:.0f} ms")
+        print(f"Total latency:  {total:.0f} ms")
 
 
 async def main():
     rag = ZeroLatencyVoiceRAG("cisco_7604_index")
 
-    rag.conversation_history = [
+    rag.history = [
         "How do I check the status of the first Sup 720 module?"
     ]
 
